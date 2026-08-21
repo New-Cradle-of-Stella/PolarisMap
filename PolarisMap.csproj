@@ -6,4 +6,5 @@
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="..\PolarisCore\PolarisCore.csproj" /></ItemGroup>
+  <Import Project="..\PolarisCore\build\Polaris.Runtime.props" />
 </Project>
