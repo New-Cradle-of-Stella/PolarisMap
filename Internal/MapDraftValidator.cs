@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Text;
 
 namespace Polaris.Map.Internal
 {
@@ -72,7 +71,7 @@ namespace Polaris.Map.Internal
                     "TMAP cannot represent a flipped element at exactly 0% opacity; use 1% or disable flip.",
                     nameof(draft));
             }
-            if (element.Rotation < short.MinValue || element.Rotation > short.MaxValue)
+            if (!MapFormat.IsValidRotation(element.Rotation))
             {
                 throw new ArgumentOutOfRangeException(nameof(draft), "Element rotation exceeds the TMAP i16 range.");
             }
@@ -94,7 +93,7 @@ namespace Polaris.Map.Internal
 
         static void RequireDimension(int value, string name)
         {
-            if (value <= 0 || value > ushort.MaxValue / MapFormat.CellPixels)
+            if (!MapFormat.IsValidDimensionPixels(value))
             {
                 throw new ArgumentOutOfRangeException(
                     "draft", $"Map {name} is outside the TMAP u16 pixel range.");
@@ -107,7 +106,7 @@ namespace Polaris.Map.Internal
             {
                 throw new ArgumentException($"{what} cannot be empty.");
             }
-            if (Encoding.UTF8.GetByteCount(value) > byte.MaxValue)
+            if (MapFormat.ExceedsUtf8ByteLimit(value, MapFormat.MaxPascalStringBytes))
             {
                 throw new ArgumentException($"{what} exceeds 255 UTF-8 bytes.");
             }
@@ -115,7 +114,7 @@ namespace Polaris.Map.Internal
 
         static void RequireString(string value, string what)
         {
-            if (Encoding.UTF8.GetByteCount(value) > ushort.MaxValue)
+            if (MapFormat.ExceedsUtf8ByteLimit(value, MapFormat.MaxLongStringBytes))
             {
                 throw new ArgumentException($"{what} exceeds 65535 UTF-8 bytes.");
             }

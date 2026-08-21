@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -10,6 +9,7 @@ using Polaris.Map.Debugging;
 
 namespace Polaris.Map.Internal
 {
+    /// <summary>主线程上的地图转场与 .pmap 所有权账本；热重载请求的排队与等待见 <see cref="MapHotReloadQueue"/>。</summary>
     internal static class MapRuntime
     {
         sealed class PendingTransition
@@ -33,18 +33,8 @@ namespace Polaris.Map.Internal
             internal PmapDocument Document;
         }
 
-        sealed class HotReloadRequest
-        {
-            internal string Key;
-            internal string Xml;
-            internal readonly ManualResetEventSlim Done = new(false);
-            internal bool Ok;
-            internal string Error;
-        }
-
         static readonly List<PendingTransition> Pending = new();
         static readonly Dictionary<string, OwnedMap> Owned = new(StringComparer.Ordinal);
-        static readonly ConcurrentQueue<HotReloadRequest> HotReloadQueue = new();
         static int mainThreadId;
         static string lastActivity = "No .pmap activity in this session.";
 
@@ -123,15 +113,16 @@ namespace Polaris.Map.Internal
             }
 
             MapTransition transition = InstallOwnedAndEnter(document);
+            string xml = sourceXml ?? document.ToXml();
             Owned[document.Key] = new OwnedMap
             {
                 Owner = owner,
-                SourceXml = sourceXml ?? document.ToXml(),
-                Document = PmapDocument.Parse(sourceXml ?? document.ToXml(), document.Key + ".pmap"),
+                SourceXml = xml,
+                Document = PmapDocument.Parse(xml, document.Key + ".pmap"),
             };
             lastActivity = $"Loading {document.Key} from .pmap.";
 
-            if (IsHotReloadEnabled(owner))
+            if (HasHotReloadMarker(owner))
                 PmapHotReloadServer.Start();
             return transition;
         }
@@ -177,17 +168,11 @@ namespace Polaris.Map.Internal
         }
 
         internal static (bool ok, string error) EnqueueHotReload(string key, string xml, TimeSpan timeout)
-        {
-            var request = new HotReloadRequest { Key = key, Xml = xml };
-            HotReloadQueue.Enqueue(request);
-            return request.Done.Wait(timeout)
-                ? (request.Ok, request.Error)
-                : (false, "Timed out waiting for the game main thread to start the full map reload.");
-        }
+            => MapHotReloadQueue.Enqueue(key, xml, timeout);
 
         internal static void Update()
         {
-            DrainHotReloadQueue();
+            MapHotReloadQueue.Drain(ApplyHotReload);
             for (int i = Pending.Count - 1; i >= 0; i--)
             {
                 PendingTransition item = Pending[i];
@@ -234,12 +219,7 @@ namespace Polaris.Map.Internal
             Pending.Clear();
             Owned.Clear();
             lastActivity = "PolarisMap is shut down.";
-            while (HotReloadQueue.TryDequeue(out HotReloadRequest request))
-            {
-                request.Ok = false;
-                request.Error = "PolarisMap shut down before the hot reload was processed.";
-                request.Done.Set();
-            }
+            MapHotReloadQueue.CancelAll("PolarisMap shut down before the hot reload was processed.");
             mainThreadId = 0;
         }
 
@@ -264,49 +244,34 @@ namespace Polaris.Map.Internal
             Pending.RemoveAt(index);
         }
 
-        static void DrainHotReloadQueue()
+        /// <summary>在主线程套用一帧热重载；失败时抛出，由 <see cref="MapHotReloadQueue"/> 回传给调用方。</summary>
+        static void ApplyHotReload(string key, string xml)
         {
-            while (HotReloadQueue.TryDequeue(out HotReloadRequest request))
-            {
-                try
-                {
-                    if (!Owned.TryGetValue(request.Key, out OwnedMap owned))
-                        throw new InvalidOperationException($".pmap is not loaded through PolarisMap: {request.Key}.");
-                    if (!IsHotReloadEnabled(owned.Owner))
-                        throw new InvalidOperationException(
-                            $"The plugin owning '{request.Key}' has not enabled PMapHotFixEnabled.");
+            OwnedMap owned = RequireHotReloadable(key);
+            PmapDocument document = PmapDocument.Parse(xml, key + ".pmap hot reload");
+            if (!string.Equals(document.Key, key, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"Hot reload frame key '{key}' does not match XML key '{document.Key}'.");
 
-                    PmapDocument document = PmapDocument.Parse(request.Xml, request.Key + ".pmap hot reload");
-                    if (!string.Equals(document.Key, request.Key, StringComparison.Ordinal))
-                        throw new InvalidOperationException(
-                            $"Hot reload frame key '{request.Key}' does not match XML key '{document.Key}'.");
-
-                    InstallOwnedAndEnter(document);
-                    owned.SourceXml = request.Xml;
-                    owned.Document = document;
-                    lastActivity = $"Full hot reload started for {request.Key}.";
-                    request.Ok = true;
-                    request.Error = "";
-                }
-                catch (Exception ex)
-                {
-                    request.Ok = false;
-                    request.Error = ex.Message;
-                    PolarisAPI.Errors.Report(ex, "PolarisMap full hot reload");
-                }
-                finally
-                {
-                    request.Done.Set();
-                }
-            }
+            InstallOwnedAndEnter(document);
+            owned.SourceXml = xml;
+            owned.Document = document;
+            lastActivity = $"Full hot reload started for {key}.";
         }
 
-        static bool IsHotReloadEnabled(Assembly assembly)
-            => PolarisAPI.Types.Of(assembly)
-                .Any(type => type.GetCustomAttribute<PMapHotFixEnabledAttribute>() != null);
+        static OwnedMap RequireHotReloadable(string key)
+        {
+            if (!Owned.TryGetValue(key, out OwnedMap owned))
+                throw new InvalidOperationException($".pmap is not loaded through PolarisMap: {key}.");
+            if (!HasHotReloadMarker(owned.Owner))
+                throw new InvalidOperationException($"The plugin owning '{key}' has not enabled PMapHotFixEnabled.");
+            return owned;
+        }
 
         internal static bool HasHotReloadMarker(Assembly assembly)
-            => assembly != null && IsHotReloadEnabled(assembly);
+            => assembly != null
+                && PolarisAPI.Types.Of(assembly)
+                    .Any(type => type.GetCustomAttribute<PMapHotFixEnabledAttribute>() != null);
 
         internal static MapDebugSnapshot GetDebugSnapshot()
         {
@@ -336,11 +301,7 @@ namespace Polaris.Map.Internal
         internal static MapTransition DebugReload(string key)
         {
             EnsureMainThread();
-            if (!Owned.TryGetValue(key, out OwnedMap owned))
-                throw new InvalidOperationException($".pmap is not loaded through PolarisMap: {key}.");
-            if (!IsHotReloadEnabled(owned.Owner))
-                throw new InvalidOperationException($"The plugin owning '{key}' has not enabled PMapHotFixEnabled.");
-
+            OwnedMap owned = RequireHotReloadable(key);
             MapTransition transition = InstallOwnedAndEnter(owned.Document);
             lastActivity = $"F11 requested a full reload for {key}.";
             return transition;

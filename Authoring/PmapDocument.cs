@@ -4,19 +4,17 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
+using Polaris.Map.Internal;
 
 namespace Polaris.Map.Authoring
 {
-    /// <summary>Polaris 的 XML 地图源文件；它是 TMAP v4 的可读、高层封装。</summary>
+    /// <summary>Polaris 的 XML 地图源文件；它是 TMAP v4 的可读、高层封装。数值规则（正则、字节上限）与
+    /// <see cref="MapDraftValidator"/> 共享同一份出处，见 <see cref="MapFormat"/>。</summary>
     public sealed class PmapDocument
     {
         public const int CurrentVersion = 1;
-        private const int CellPixels = 28;
-        private static readonly Regex SafeMapKey = new Regex(
-            @"^[A-Za-z0-9_-][A-Za-z0-9_.-]*$", RegexOptions.CultureInvariant);
 
         public int Version { get; set; } = CurrentVersion;
         public string Key { get; set; } = "new_map";
@@ -128,13 +126,13 @@ namespace Polaris.Map.Authoring
                 throw new PmapFormatException("Unsupported .pmap version " + Version + "; expected " + CurrentVersion + ".");
             if (string.IsNullOrWhiteSpace(Key))
                 throw new PmapFormatException("Map key cannot be empty.");
-            if (!SafeMapKey.IsMatch(Key))
+            if (!MapFormat.IsSafeMapKey(Key))
                 throw new PmapFormatException("Map key may contain only ASCII letters, digits, underscores, dots or hyphens, and may not begin with a dot.");
-            if (Encoding.UTF8.GetByteCount(Key) > byte.MaxValue)
+            if (MapFormat.ExceedsUtf8ByteLimit(Key, MapFormat.MaxPascalStringBytes))
                 throw new PmapFormatException("Map key exceeds 255 UTF-8 bytes.");
-            if (Width <= 0 || Height <= 0 || Width > ushort.MaxValue / CellPixels || Height > ushort.MaxValue / CellPixels)
+            if (!MapFormat.IsValidDimensionPixels(Width) || !MapFormat.IsValidDimensionPixels(Height))
                 throw new PmapFormatException("Map width/height is outside the TMAP u16 pixel range.");
-            if (Encoding.UTF8.GetByteCount(Comment ?? "") > ushort.MaxValue)
+            if (MapFormat.ExceedsUtf8ByteLimit(Comment, MapFormat.MaxLongStringBytes))
                 throw new PmapFormatException("Map comment exceeds 65535 UTF-8 bytes.");
             NormalizeColor(Background);
             if (Layers.Count == 0)
@@ -148,11 +146,11 @@ namespace Polaris.Map.Authoring
             {
                 if (string.IsNullOrWhiteSpace(layer.Name))
                     throw new PmapFormatException("Layer name cannot be empty.");
-                if (Encoding.UTF8.GetByteCount(layer.Name) > byte.MaxValue)
+                if (MapFormat.ExceedsUtf8ByteLimit(layer.Name, MapFormat.MaxPascalStringBytes))
                     throw new PmapFormatException("Layer name exceeds 255 UTF-8 bytes: " + layer.Name + ".");
                 if (!layerNames.Add(layer.Name))
                     throw new PmapFormatException("Duplicate layer name: " + layer.Name + ".");
-                if (Encoding.UTF8.GetByteCount(layer.Comment ?? "") > ushort.MaxValue)
+                if (MapFormat.ExceedsUtf8ByteLimit(layer.Comment, MapFormat.MaxLongStringBytes))
                     throw new PmapFormatException("Layer comment exceeds 65535 UTF-8 bytes: " + layer.Name + ".");
                 NormalizeColor(layer.Color);
                 foreach (PmapElement element in layer.Elements)
@@ -166,14 +164,14 @@ namespace Polaris.Map.Authoring
                     if (!Finite(element.VisualWidth) || !Finite(element.VisualHeight)
                         || element.VisualWidth <= 0 || element.VisualHeight <= 0)
                         throw new PmapFormatException("visualWidth and visualHeight must be positive.");
-                    if (element.Opacity < 0 || element.Opacity > 100)
+                    if (!MapFormat.IsValidOpacity(element.Opacity))
                         throw new PmapFormatException("Element opacity must be between 0 and 100.");
                     if (element.Kind == PmapElementKind.Chip && (element.X % 1 != 0 || element.Y % 1 != 0))
                         throw new PmapFormatException("Chip x/y must be whole map-cell coordinates.");
                     if (element.Kind == PmapElementKind.Chip
                         && (element.X < 0 || element.X >= Width || element.Y < 0 || element.Y >= Height))
                         throw new PmapFormatException("Chip coordinates are outside the map.");
-                    if (element.Rotation < short.MinValue || element.Rotation > short.MaxValue)
+                    if (!MapFormat.IsValidRotation(element.Rotation))
                         throw new PmapFormatException("Element rotation exceeds the TMAP i16 range.");
                     if (element.Flip && element.Opacity == 0)
                         throw new PmapFormatException("TMAP cannot encode a flipped element at exactly 0% opacity.");
