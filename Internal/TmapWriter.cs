@@ -25,6 +25,7 @@ namespace Polaris.Map.Internal
             var writer = new BigEndianWriter(output);
             WriteHeader(writer, draft, images.Values);
             WriteLayers(writer, draft, keyLayerIndex, images);
+            WriteJoints(writer, draft);
             return output.ToArray();
         }
 
@@ -61,6 +62,33 @@ namespace Polaris.Map.Internal
             writer.Byte(draft.Background.Blue);
             writer.Tag(Map2d.BIN_CTG.COMMENT);
             writer.String(draft.Comment ?? "");
+
+            if (draft.CspKeys.Count != 0 || draft.CspExpectedCount != 0)
+            {
+                writer.Tag(Map2d.BIN_CTG.CSP);
+                writer.Byte(draft.CspExpectedCount == 0
+                    ? checked((byte)draft.CspKeys.Count)
+                    : draft.CspExpectedCount);
+                writer.Byte(checked((byte)draft.CspKeys.Count));
+                foreach (string key in draft.CspKeys) writer.Pascal(key);
+            }
+
+            if (draft.EditorAdditional.Count != 0)
+            {
+                writer.Tag(Map2d.BIN_CTG.EDITOR_ADDITIONAL);
+                writer.Byte(checked((byte)draft.EditorAdditional.Count));
+                foreach (string value in draft.EditorAdditional) writer.Pascal(value);
+            }
+
+            foreach (MapMeshRectDraft rect in draft.MeshRects)
+            {
+                writer.Tag(Map2d.BIN_CTG.MESH_RECT);
+                writer.Byte(rect.Index);
+                writer.Float(rect.X);
+                writer.Float(rect.Y);
+                writer.Float(rect.Width);
+                writer.Float(rect.Height);
+            }
 
             string[] directories = images
                 .Select(static image => image.Directory)
@@ -102,8 +130,8 @@ namespace Polaris.Map.Internal
                 writer.Byte((byte)(i == keyLayerIndex ? 1 : 0));
                 writer.UInt(PackLayerColor(layer.Color));
                 writer.UInt((uint)Math.Max(MapFormat.DefaultCollectionCapacity, layer.Elements.Count));
-                writer.Byte(MapFormat.DefaultCollectionCapacity);
-                writer.Byte(MapFormat.DefaultCollectionCapacity);
+                writer.Byte(checked((byte)Math.Max(MapFormat.DefaultCollectionCapacity, layer.LabelPoints.Count)));
+                writer.Byte(checked((byte)Math.Max(MapFormat.DefaultCollectionCapacity, layer.Gradations.Count)));
                 writer.Tag(Map2d.BIN_CTG.LAY_CHIPS_CONTENT);
                 writer.UInt(checked((uint)content.Length));
                 writer.Bytes(content);
@@ -116,11 +144,149 @@ namespace Polaris.Map.Internal
         {
             using var output = new MemoryStream();
             var writer = new BigEndianWriter(output);
+            uint patternId = 0;
             foreach (MapElementDraft element in layer.Elements)
             {
+                if (element.PatternId != patternId)
+                {
+                    writer.Tag(Map2d.BIN_CTG.PAT_CHANGE);
+                    writer.UInt(element.PatternId);
+                    patternId = element.PatternId;
+                }
                 WriteElement(writer, element, images[element]);
             }
+            foreach (MapLabelPointDraft point in layer.LabelPoints) WriteLabelPoint(writer, point);
+            foreach (MapGradationDraft gradation in layer.Gradations) WriteGradation(writer, gradation);
+            foreach (MapSubMapDraft subMap in layer.SubMaps) WriteSubMap(writer, subMap);
             return output.ToArray();
+        }
+
+        static void WriteLabelPoint(BigEndianWriter writer, MapLabelPointDraft value)
+        {
+            writer.Tag(Map2d.BIN_CTG.LP);
+            writer.Pascal(value.Key);
+            writer.Short(ToPixelShort(value.X));
+            writer.Short(ToPixelShort(value.Y));
+            writer.Short(ToPixelShort(value.Width));
+            writer.Short(ToPixelShort(value.Height));
+            writer.Float(value.FocusX);
+            writer.Float(value.FocusY);
+            writer.String(value.Command ?? "");
+            writer.String(value.Comment ?? "");
+        }
+
+        static void WriteGradation(BigEndianWriter writer, MapGradationDraft value)
+        {
+            writer.Tag(Map2d.BIN_CTG.GRD);
+            writer.Pascal(value.Key);
+            writer.Short(ToPixelShort(value.X));
+            writer.Short(ToPixelShort(value.Y));
+            writer.Short(ToPixelShort(value.Width));
+            writer.Short(ToPixelShort(value.Height));
+            writer.Byte((byte)value.Order);
+            writer.Byte((byte)value.Direction);
+            WriteColor(writer, value.StartColor);
+            WriteColor(writer, value.EndColor);
+            if (value.Direction != MapGradationDirection.Slicer) return;
+            writer.Byte(value.SlicerColumns);
+            if (value.SlicerColumns == 0) return;
+            writer.Byte(value.SlicerRows);
+            foreach (float sample in value.InternalX) writer.Float(sample);
+            foreach (float sample in value.InternalY) writer.Float(sample);
+            foreach (float sample in value.Levels) writer.Float(sample);
+        }
+
+        static void WriteSubMap(BigEndianWriter writer, MapSubMapDraft value)
+        {
+            writer.Tag(Map2d.BIN_CTG.SM);
+            writer.Pascal(value.TargetMapKey);
+            writer.Float(value.X);
+            writer.Float(value.Y);
+            writer.Float(value.BaseX);
+            writer.Float(value.BaseY);
+            writer.Float(value.ScaleX);
+            writer.Float(value.ScaleY);
+            writer.Float(value.ScrollX);
+            writer.Float(value.ScrollY);
+            writer.Byte((byte)value.Order);
+            writer.Byte(value.RepeatX);
+            writer.Byte(value.RepeatY);
+            writer.Float(value.IntervalX);
+            writer.Float(value.IntervalY);
+            writer.Float(value.CameraLength);
+        }
+
+        static void WriteJoints(BigEndianWriter writer, MapDraft draft)
+        {
+            var references = new Dictionary<string, ChipReference>(StringComparer.Ordinal);
+            for (int layerIndex = 0; layerIndex < draft.Layers.Count; layerIndex++)
+            {
+                MapLayerDraft layer = draft.Layers[layerIndex];
+                for (int elementIndex = 0; elementIndex < layer.Elements.Count; elementIndex++)
+                {
+                    MapElementDraft element = layer.Elements[elementIndex];
+                    if (!string.IsNullOrEmpty(element.Id))
+                        references.Add(element.Id, new ChipReference(layerIndex, elementIndex, element.Kind));
+                }
+            }
+
+            for (int layerIndex = 0; layerIndex < draft.Layers.Count; layerIndex++)
+            {
+                MapLayerDraft layer = draft.Layers[layerIndex];
+                if (layer.Joints.Count == 0) continue;
+                byte encodedLayer = checked((byte)layerIndex);
+                writer.Tag(Map2d.BIN_CTG.JOINT_COUNT);
+                writer.Byte(encodedLayer);
+                writer.UShort(checked((ushort)layer.Joints.Count));
+                foreach (MapJointDraft joint in layer.Joints)
+                {
+                    writer.Tag(Map2d.BIN_CTG.JOINT);
+                    writer.Byte(encodedLayer);
+                    writer.Byte(checked((byte)joint.Points.Count));
+                    writer.Float(joint.CenterX);
+                    writer.Float(joint.CenterY);
+                    WriteColor(writer, joint.Color);
+                    writer.Byte(joint.Thickness);
+                    foreach (MapJointPointDraft point in joint.Points)
+                    {
+                        writer.Float(point.X);
+                        writer.Float(point.Y);
+                        if (string.IsNullOrEmpty(point.ChipId))
+                        {
+                            writer.Int(-1);
+                            continue;
+                        }
+                        ChipReference reference = references[point.ChipId];
+                        writer.Int(reference.ElementIndex);
+                        writer.Byte(checked((byte)reference.LayerIndex));
+                    }
+                }
+            }
+        }
+
+        static short ToPixelShort(float cells)
+            => checked((short)Math.Round(cells * MapFormat.CellPixels, MidpointRounding.AwayFromZero));
+
+        static void WriteColor(BigEndianWriter writer, MapColor color)
+        {
+            writer.Byte(color.Red);
+            writer.Byte(color.Green);
+            writer.Byte(color.Blue);
+            writer.Byte(color.Alpha);
+        }
+
+        readonly struct ChipReference
+        {
+            internal ChipReference(int layerIndex, int elementIndex, MapElementKind kind)
+            {
+                LayerIndex = layerIndex;
+                ElementIndex = elementIndex;
+                Kind = kind;
+            }
+
+            internal int LayerIndex { get; }
+            internal int ElementIndex { get; }
+            internal MapElementKind Kind { get; }
         }
 
         static void WriteElement(
@@ -135,7 +301,7 @@ namespace Polaris.Map.Internal
             {
                 rotation = MapFormat.NormalizeQuarterTurns(element.Rotation);
                 CalculateChipDrawPosition(
-                    resolved.Image, (int)element.X, (int)element.Y, rotation, element.Flip,
+                    resolved.Image, element.X, element.Y, rotation, element.Flip,
                     out drawX, out drawY);
                 writer.Tag(Map2d.BIN_CTG.CP);
             }
@@ -155,8 +321,8 @@ namespace Polaris.Map.Internal
 
         static void CalculateChipDrawPosition(
             M2ChipImage image,
-            int mapX,
-            int mapY,
+            float mapX,
+            float mapY,
             int rotation,
             bool flip,
             out int drawX,
@@ -168,9 +334,9 @@ namespace Polaris.Map.Internal
             Vector2Int shift = image.getShift(rotation, flip);
             Vector2Int rotated = image.getRWH(rotation);
 
-            drawX = checked(mapX * MapFormat.CellPixels);
+            drawX = X.IntR(mapX * MapFormat.CellPixels);
             drawX += shift.x < 0 ? -(rotated.x - width + shift.x) : shift.x;
-            drawY = checked(mapY * MapFormat.CellPixels);
+            drawY = X.IntR(mapY * MapFormat.CellPixels);
             drawY += shift.y < 0 ? -(rotated.y - height + shift.y) : shift.y;
         }
 

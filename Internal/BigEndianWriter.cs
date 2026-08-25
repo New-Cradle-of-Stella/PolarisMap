@@ -25,6 +25,16 @@ namespace Polaris.Map.Internal
 
         internal void Int(int value) => UInt(unchecked((uint)value));
 
+        internal void Float(float value)
+        {
+            byte[] bytes = System.BitConverter.GetBytes(value);
+            if (System.BitConverter.IsLittleEndian)
+            {
+                System.Array.Reverse(bytes);
+            }
+            Bytes(bytes);
+        }
+
         internal void UInt(uint value)
         {
             Byte((byte)(value >> 24));

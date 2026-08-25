@@ -173,6 +173,7 @@ namespace Polaris.Map.Internal
         internal static void Update()
         {
             MapHotReloadQueue.Drain(ApplyHotReload);
+            MapPreviewQueue.Drain();
             for (int i = Pending.Count - 1; i >= 0; i--)
             {
                 PendingTransition item = Pending[i];
@@ -220,6 +221,9 @@ namespace Polaris.Map.Internal
             Owned.Clear();
             lastActivity = "PolarisMap is shut down.";
             MapHotReloadQueue.CancelAll("PolarisMap shut down before the hot reload was processed.");
+            MapPreviewQueue.CancelAll("PolarisMap shut down before the preview request was processed.");
+            try { MapPreviewExtractor.Clear(); }
+            catch (Exception ex) { PolarisAPI.Errors.Report(ex, "PolarisMap preview cleanup"); }
             mainThreadId = 0;
         }
 
@@ -270,8 +274,9 @@ namespace Polaris.Map.Internal
 
         internal static bool HasHotReloadMarker(Assembly assembly)
             => assembly != null
-                && PolarisAPI.Types.Of(assembly)
-                    .Any(type => type.GetCustomAttribute<PMapHotFixEnabledAttribute>() != null);
+                && PolarisAPI.Types.WithAttribute<PMapHotFixEnabledAttribute>(
+                        PolarisAPI.Types.Of(assembly))
+                    .Any();
 
         internal static MapDebugSnapshot GetDebugSnapshot()
         {

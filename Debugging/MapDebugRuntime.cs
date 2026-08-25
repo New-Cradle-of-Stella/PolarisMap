@@ -12,16 +12,15 @@ namespace Polaris.Map.Debugging
 
         internal static bool IsEnabled { get; private set; }
 
-        internal static void Start(bool enabled)
+        internal static void Start(bool hotReloadEnabled)
         {
-            IsEnabled = enabled;
-            if (!enabled) return;
+            IsEnabled = true;
 
             root = new GameObject("PolarisMap Debug");
             UnityEngine.Object.DontDestroyOnLoad(root);
             root.AddComponent<MapDebugOverlay>();
-            PmapHotReloadServer.Start();
-            Debug.Log("[PolarisMap] .pmap debug enabled; F11 opens the map inspector.");
+            if (hotReloadEnabled) PmapHotReloadServer.Start();
+            Debug.Log("[PolarisMap] F11 opens the map inspector and full-scene PNG exporter.");
         }
 
         internal static void Update()

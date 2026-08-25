@@ -1,32 +1,52 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.IO;
 using System.Linq;
-using Polaris.Map.Authoring;
+using System.Reflection;
+using m2d;
 using Polaris.Map.Internal;
 using UnityEngine;
 using XX;
 
 namespace Polaris.Map.Debugging
 {
-    /// <summary>F11 打开的 PolarisMap 专用 IMGUI 检查台；只画 .pmap 抽象蓝图，不接触游戏贴图。</summary>
+    /// <summary>Minimal, default-skin IMGUI controls for map reload and PNG export.</summary>
     internal static class MapDebugPage
     {
         const string InputFlag = "__PMAP_DBG";
-        const int WindowId = 0x504D4150; // PMAP
-        static readonly string[] Tabs = { "Blueprint", "XML" };
-        static readonly List<Texture2D> StyleTextures = new();
+        const int WindowId = 0x504D4150;
+        const BindingFlags InstancePrivate = BindingFlags.Instance | BindingFlags.NonPublic;
+        static readonly string[] Tabs = { "Map Export", "PMap Debug" };
 
-        static Rect window = new Rect(48f, 42f, 980f, 650f);
+        static readonly FieldInfo CameraMeshes = typeof(M2Camera).GetField("MMRD", InstancePrivate)
+            ?? throw new MissingFieldException(typeof(M2Camera).FullName, "MMRD");
+        static readonly FieldInfo ActiveCameraMap = typeof(M2Camera).GetField("Md", InstancePrivate)
+            ?? throw new MissingFieldException(typeof(M2Camera).FullName, "Md");
+
+        static M2MeshContainer cameraMeshes;
+        static GameObject cameraCompositeObject;
+        static int cameraCompositeIndex = -1;
+        static Material cameraCompositeMaterial;
+        static Material shadowFreeCameraCompositeMaterial;
+        static Map2d cameraCompositeMap;
+
+        static Rect window = new Rect(40f, 40f, 620f, 610f);
         static Vector2 mapScroll;
-        static Vector2 xmlScroll;
+        static Vector2 layerScroll;
         static bool open;
         static bool inputHeld;
-        static bool stylesReady;
         static int tab;
         static string selectedKey;
-        static string notice = "F11 closes this page.";
+        static string notice = "Ready.";
+        static string exportMapId = string.Empty;
+        static string exportPath = string.Empty;
+        static bool exportEntities = true;
+        static bool hideCameraBorderShadow;
+        static float exportBoundsExpansionPercent = 20f;
+        static MapPngExport exportJob;
+        static Map2d analyzedLayerMap;
+        static M2MapLayer[] analyzedLayers = Array.Empty<M2MapLayer>();
+        static bool[] exportLayerEnabled = Array.Empty<bool>();
 
         internal static void Toggle()
         {
@@ -51,271 +71,203 @@ namespace Polaris.Map.Debugging
 
         internal static void Shutdown()
         {
+            hideCameraBorderShadow = false;
+            ApplyCameraBorderShadowSwitch();
             Close();
-            foreach (Texture2D texture in StyleTextures)
-            {
-                if (texture != null) UnityEngine.Object.Destroy(texture);
-            }
-            StyleTextures.Clear();
-            stylesReady = false;
         }
 
         internal static void Draw()
         {
+            ApplyCameraBorderShadowSwitch();
             if (!open) return;
-            EnsureStyles();
             GUI.depth = -1090;
-            window = GUI.Window(WindowId, window, DrawWindow, "POLARIS MAP / F11", Styles.Window);
+            window = GUI.Window(WindowId, window, DrawWindow, "PolarisMap Debug (F11)");
         }
 
         static void DrawWindow(int id)
         {
-            MapDebugSnapshot snapshot;
             try
             {
-                snapshot = MapRuntime.GetDebugSnapshot();
+                MapDebugSnapshot snapshot = MapRuntime.GetDebugSnapshot();
+                InitializeFields(snapshot);
+                tab = GUILayout.Toolbar(tab, Tabs);
+                GUILayout.Space(6f);
+
+                if (tab == 0) DrawExportPage();
+                else DrawPmapDebugPage(snapshot);
+
+                GUILayout.FlexibleSpace();
+                GUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Close", GUILayout.Width(80f))) Close();
+                GUILayout.EndHorizontal();
+
+                GUILayout.Space(5f);
+                GUILayout.Label(notice ?? string.Empty);
             }
             catch (Exception ex)
             {
-                GUILayout.Label(ex.Message, Styles.Error);
-                GUI.DragWindow(new Rect(0, 0, window.width, 24));
-                return;
+                GUILayout.Label(ex.ToString());
+            }
+
+            GUI.DragWindow(new Rect(0f, 0f, window.width, 22f));
+        }
+
+        static void DrawExportPage()
+        {
+            RefreshMapLayers();
+            GUILayout.Label("Current map: " + (exportMapId ?? "(none)"));
+
+            bool hideBorder = GUILayout.Toggle(
+                hideCameraBorderShadow,
+                "Remove main_rendered camera shadow");
+            if (hideBorder != hideCameraBorderShadow)
+            {
+                hideCameraBorderShadow = hideBorder;
+                ApplyCameraBorderShadowSwitch();
             }
 
             GUILayout.BeginHorizontal();
-            GUILayout.Label("MAP SESSION", Styles.Eyebrow, GUILayout.Width(100f));
-            GUILayout.Label(snapshot.CurrentKey == null ? "No active map" : "Current  " + snapshot.CurrentKey,
-                snapshot.CurrentKey == null ? Styles.Dim : Styles.Current);
-            GUILayout.FlexibleSpace();
-            GUILayout.Label(snapshot.CapturedAt.ToString("HH:mm:ss", CultureInfo.InvariantCulture), Styles.MonoDim);
+            GUILayout.Label("Output PNG", GUILayout.Width(70f));
+            exportPath = GUILayout.TextField(exportPath ?? string.Empty);
+            if (GUILayout.Button("Default", GUILayout.Width(90f)))
+                exportPath = DefaultExportPath(exportMapId);
             GUILayout.EndHorizontal();
 
-            GUILayout.Space(5f);
+            exportEntities = GUILayout.Toggle(exportEntities, "Include player, NPCs and enemies");
+
             GUILayout.BeginHorizontal();
-            DrawMapList(snapshot);
-            GUILayout.Space(8f);
-            DrawInspector(snapshot);
+            GUILayout.Label("Expand bounds", GUILayout.Width(70f));
+            exportBoundsExpansionPercent = GUILayout.HorizontalSlider(
+                exportBoundsExpansionPercent, 0f, 100f, GUILayout.MinWidth(120f));
+            exportBoundsExpansionPercent = Mathf.Round(exportBoundsExpansionPercent);
+            GUILayout.Label($"{exportBoundsExpansionPercent:0}%", GUILayout.Width(45f));
             GUILayout.EndHorizontal();
 
-            GUILayout.Space(6f);
+            DrawMapLayers();
+
             GUILayout.BeginHorizontal();
-            GUILayout.Label(string.IsNullOrEmpty(notice) ? snapshot.Activity : notice, Styles.Status);
             GUILayout.FlexibleSpace();
-            if (GUILayout.Button("Close  F11", Styles.Button, GUILayout.Width(108f))) Close();
+            GUILayout.Label(exportJob == null ? "" : exportJob.Status.ToString(), GUILayout.Width(100f));
+            bool wasEnabled = GUI.enabled;
+            GUI.enabled = wasEnabled
+                && !string.IsNullOrWhiteSpace(exportMapId)
+                && (exportJob == null || exportJob.IsFinished);
+            if (GUILayout.Button("Export PNG", GUILayout.Width(100f))) StartPngExport();
+            GUI.enabled = wasEnabled;
             GUILayout.EndHorizontal();
-            GUI.DragWindow(new Rect(0, 0, window.width, 24f));
         }
 
-        static void DrawMapList(MapDebugSnapshot snapshot)
+        static void DrawPmapDebugPage(MapDebugSnapshot snapshot)
         {
-            float height = Mathf.Max(160f, window.height - 94f);
-            GUILayout.BeginVertical(Styles.Panel, GUILayout.Width(250f), GUILayout.Height(height));
-            GUILayout.Label("LOADED .PMAP", Styles.Eyebrow);
-            GUILayout.Label(snapshot.Maps.Count == 0
-                ? "No generated .pmap has entered this session."
-                : snapshot.Maps.Count + " managed map(s)", Styles.Dim);
-            GUILayout.Space(5f);
-
-            mapScroll = GUILayout.BeginScrollView(mapScroll);
-            foreach (MapDebugEntry entry in snapshot.Maps)
+            GUILayout.Label("Loaded PolarisMap maps");
+            mapScroll = GUILayout.BeginScrollView(mapScroll, GUILayout.Height(360f));
+            if (snapshot.Maps.Count == 0)
             {
-                bool selected = string.Equals(selectedKey, entry.Key, StringComparison.Ordinal);
-                string prefix = entry.IsLoading ? "↻  " : entry.IsCurrent ? "●  " : "○  ";
-                if (GUILayout.Button(prefix + entry.Key, selected ? Styles.SelectedButton : Styles.Button))
+                GUILayout.Label("No generated .pmap is loaded in this session.");
+            }
+            else
+            {
+                foreach (MapDebugEntry entry in snapshot.Maps)
                 {
-                    selectedKey = entry.Key;
-                    xmlScroll = Vector2.zero;
-                    notice = "Selected " + entry.Key + ".";
+                    GUILayout.BeginHorizontal();
+                    bool selected = string.Equals(selectedKey, entry.Key, StringComparison.Ordinal);
+                    if (GUILayout.Toggle(selected, entry.Key, "Button")) selectedKey = entry.Key;
+                    GUILayout.Label(entry.IsCurrent ? "current" : entry.IsLoading ? "loading" : "", GUILayout.Width(55f));
+                    GUILayout.EndHorizontal();
                 }
-                GUILayout.Label(
-                    $"{entry.Document.Width}×{entry.Document.Height}  ·  {entry.Document.Layers.Count} layers  ·  {entry.ElementCount} elements",
-                    Styles.MonoDim);
-                GUILayout.Space(4f);
             }
             GUILayout.EndScrollView();
 
-            GUILayout.FlexibleSpace();
-            GUILayout.Label("[PMapHotFixEnabled]", Styles.Marker);
-            GUILayout.Label("F11 and the debug pipe are enabled because a plugin assembly carries this marker.", Styles.Small);
-            GUILayout.EndVertical();
-        }
-
-        static void DrawInspector(MapDebugSnapshot snapshot)
-        {
-            float height = Mathf.Max(160f, window.height - 94f);
-            GUILayout.BeginVertical(Styles.Panel, GUILayout.ExpandWidth(true), GUILayout.Height(height));
-            MapDebugEntry entry = Selected(snapshot);
-            if (entry == null)
+            GUILayout.BeginHorizontal();
+            MapDebugEntry selectedEntry = Selected(snapshot);
+            bool oldEnabled = GUI.enabled;
+            GUI.enabled = oldEnabled && selectedEntry != null && !selectedEntry.IsLoading;
+            if (GUILayout.Button("Reload and enter")) Reload(selectedEntry);
+            if (GUILayout.Button("Copy XML"))
             {
-                GUILayout.Label("NO PMAP SELECTED", Styles.Header);
-                GUILayout.Space(8f);
-                GUILayout.Label(snapshot.Maps.Count == 0
-                    ? "Load a generated .pmap through PolarisMap, then return here. The page will show its abstract blueprint without reading game textures."
-                    : "Choose a managed map on the left to inspect or reload it.", Styles.Empty);
-                GUILayout.EndVertical();
-                return;
+                GUIUtility.systemCopyBuffer = selectedEntry.Xml;
+                notice = "XML copied for " + selectedEntry.Key + ".";
             }
-
-            GUILayout.BeginHorizontal();
-            GUILayout.BeginVertical();
-            GUILayout.Label(entry.Key, Styles.Header);
-            GUILayout.Label("owner  " + entry.Owner, Styles.MonoDim);
-            GUILayout.EndVertical();
-            GUILayout.FlexibleSpace();
-            tab = GUILayout.Toolbar(tab, Tabs, Styles.Button, GUILayout.Width(220f));
-            GUILayout.EndHorizontal();
-            GUILayout.Space(7f);
-
-            if (tab == 0) DrawBlueprint(entry);
-            else DrawXml(entry);
-
-            GUILayout.Space(7f);
-            DrawActions(entry);
-            GUILayout.EndVertical();
-        }
-
-        static void DrawBlueprint(MapDebugEntry entry)
-        {
-            PmapDocument document = entry.Document;
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("ABSTRACT MAP", Styles.Eyebrow);
-            GUILayout.FlexibleSpace();
-            GUILayout.Label("color blocks + labels · no game assets", Styles.MonoDim);
-            GUILayout.EndHorizontal();
-
-            float canvasHeight = Mathf.Max(220f, window.height - 315f);
-            Rect canvas = GUILayoutUtility.GetRect(320f, canvasHeight, GUILayout.ExpandWidth(true));
-            DrawMiniMap(canvas, document);
-
-            GUILayout.Space(7f);
-            GUILayout.BeginHorizontal();
-            Metric("SIZE", document.Width + " × " + document.Height);
-            Metric("LAYERS", document.Layers.Count.ToString(CultureInfo.InvariantCulture));
-            Metric("ELEMENTS", entry.ElementCount.ToString(CultureInfo.InvariantCulture));
-            Metric("STATE", entry.IsLoading ? "LOADING" : entry.IsCurrent ? "CURRENT" : "READY");
+            GUI.enabled = oldEnabled;
             GUILayout.EndHorizontal();
         }
 
-        static void DrawMiniMap(Rect outer, PmapDocument document)
+        static void InitializeFields(MapDebugSnapshot snapshot)
         {
-            DrawSolid(outer, new Color(0.09f, 0.11f, 0.13f, 1f));
-            float padding = 14f;
-            float availableW = Mathf.Max(1f, outer.width - padding * 2f);
-            float availableH = Mathf.Max(1f, outer.height - padding * 2f);
-            float scale = Mathf.Min(availableW / document.Width, availableH / document.Height);
-            var map = new Rect(
-                outer.x + (outer.width - document.Width * scale) * .5f,
-                outer.y + (outer.height - document.Height * scale) * .5f,
-                document.Width * scale,
-                document.Height * scale);
-
-            DrawSolid(map, ParseColor(document.Background, new Color(.78f, .86f, .89f, 1f)));
-            Color grid = IsDark(ParseColor(document.Background, Color.gray))
-                ? new Color(1f, 1f, 1f, .11f)
-                : new Color(.10f, .14f, .17f, .15f);
-            int xStep = Math.Max(1, document.Width / 40);
-            int yStep = Math.Max(1, document.Height / 30);
-            for (int x = 0; x <= document.Width; x += xStep)
-                DrawSolid(new Rect(map.x + x * scale, map.y, 1f, map.height), grid);
-            for (int y = 0; y <= document.Height; y += yStep)
-                DrawSolid(new Rect(map.x, map.y + y * scale, map.width, 1f), grid);
-
-            foreach (PmapLayer layer in document.Layers)
+            string current = M2DBase.Instance?.curMap?.key;
+            if (!string.Equals(exportMapId, current, StringComparison.Ordinal))
             {
-                foreach (PmapElement element in layer.Elements)
-                {
-                    var rect = new Rect(
-                        map.x + element.X * scale,
-                        map.y + element.Y * scale,
-                        Mathf.Max(2f, element.VisualWidth * scale),
-                        Mathf.Max(2f, element.VisualHeight * scale));
-                    rect = Intersect(rect, map);
-                    if (rect.width <= 0 || rect.height <= 0) continue;
-                    Color color = ParseColor(element.Color,
-                        element.Kind == PmapElementKind.Chip
-                            ? new Color(.36f, .40f, .47f, 1f)
-                            : new Color(.71f, .54f, .35f, 1f));
-                    color.a *= Mathf.Max(.2f, element.Opacity / 100f);
-                    DrawSolid(rect, color);
-                    if (rect.width >= 44f && rect.height >= 15f)
+                exportMapId = current;
+                exportPath = string.IsNullOrWhiteSpace(current) ? string.Empty : DefaultExportPath(current);
+            }
+            if (string.IsNullOrWhiteSpace(selectedKey))
+                selectedKey = snapshot.Maps.FirstOrDefault(item => item.IsCurrent)?.Key
+                              ?? snapshot.Maps.FirstOrDefault()?.Key;
+        }
+
+        static void StartPngExport()
+        {
+            try
+            {
+                exportJob = MapAPI.ExportMapPng(
+                    exportMapId,
+                    exportPath,
+                    new MapPngExportOptions
                     {
-                        string label = string.IsNullOrWhiteSpace(element.Label)
-                            ? Path.GetFileNameWithoutExtension(element.Image)
-                            : element.Label;
-                        GUI.Label(rect, label, IsDark(color) ? Styles.BlockLight : Styles.BlockDark);
-                    }
-                }
-            }
-            Color frame = new Color(.50f, .72f, .79f, .9f);
-            DrawSolid(new Rect(map.x, map.y, map.width, 1f), frame);
-            DrawSolid(new Rect(map.x, map.yMax - 1f, map.width, 1f), frame);
-            DrawSolid(new Rect(map.x, map.y, 1f, map.height), frame);
-            DrawSolid(new Rect(map.xMax - 1f, map.y, 1f, map.height), frame);
-        }
-
-        static void DrawXml(MapDebugEntry entry)
-        {
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("CANONICAL SOURCE", Styles.Eyebrow);
-            GUILayout.FlexibleSpace();
-            GUILayout.Label(entry.Xml.Length + " chars", Styles.MonoDim);
-            GUILayout.EndHorizontal();
-            xmlScroll = GUILayout.BeginScrollView(xmlScroll, Styles.SourceFrame,
-                GUILayout.ExpandHeight(true), GUILayout.ExpandWidth(true));
-            bool enabled = GUI.enabled;
-            GUI.enabled = false;
-            GUILayout.TextArea(entry.Xml, Styles.Source, GUILayout.ExpandHeight(true), GUILayout.ExpandWidth(true));
-            GUI.enabled = enabled;
-            GUILayout.EndScrollView();
-        }
-
-        static void DrawActions(MapDebugEntry entry)
-        {
-            GUILayout.BeginHorizontal();
-            GUI.enabled = !entry.IsLoading;
-            if (GUILayout.Button("Full reload & enter", Styles.ReloadButton, GUILayout.Width(175f)))
-            {
-                try
+                        EnterMapIfNeeded = false,
+                        IncludeEntities = exportEntities,
+                        EnabledMapLayerIndices = EnabledLayerIndices(),
+                        IncludeDarkOverlay = true,
+                        BoundsExpansion = exportBoundsExpansionPercent * 0.01f,
+                    });
+                notice = "Export started for " + exportJob.MapId + ".";
+                exportJob.Finished += result =>
                 {
-                    MapTransition transition = MapRuntime.DebugReload(entry.Key);
-                    notice = "Full reload started for " + entry.Key + ".";
-                    transition.Finished += result => notice = result.Status == MapTransitionStatus.Completed
-                        ? "Full reload completed: " + result.TargetKey + "."
-                        : "Full reload failed: " + result.Error?.Message;
-                }
-                catch (Exception ex)
-                {
-                    notice = "Reload rejected: " + ex.Message;
-                }
+                    notice = result.Status == MapPngExportStatus.Completed
+                        ? $"Saved {result.Width}x{result.Height}: {result.OutputPath}"
+                        : "Export failed: " + result.Error?.Message;
+                    exportPath = result.OutputPath;
+                };
             }
-            GUI.enabled = true;
-            if (GUILayout.Button("Copy XML", Styles.Button, GUILayout.Width(95f)))
+            catch (Exception ex)
             {
-                GUIUtility.systemCopyBuffer = entry.Xml;
-                notice = "Copied " + entry.Key + ".pmap XML.";
+                notice = "Export rejected: " + ex.Message;
             }
-            GUILayout.Space(8f);
-            GUILayout.Label("Reload closes the old Map2d, releases its layers, creates a new instance and runs async map loading.", Styles.Small);
-            GUILayout.EndHorizontal();
         }
 
-        static void Metric(string name, string value)
+        static void Reload(MapDebugEntry entry)
         {
-            GUILayout.BeginVertical(Styles.Metric, GUILayout.MinWidth(90f));
-            GUILayout.Label(name, Styles.Eyebrow);
-            GUILayout.Label(value, Styles.MonoValue);
-            GUILayout.EndVertical();
+            if (entry == null) return;
+            try
+            {
+                MapTransition transition = MapRuntime.DebugReload(entry.Key);
+                notice = "Reload started for " + entry.Key + ".";
+                transition.Finished += result => notice = result.Status == MapTransitionStatus.Completed
+                    ? "Reload completed: " + result.TargetKey + "."
+                    : "Reload failed: " + result.Error?.Message;
+            }
+            catch (Exception ex)
+            {
+                notice = "Reload rejected: " + ex.Message;
+            }
         }
 
         static MapDebugEntry Selected(MapDebugSnapshot snapshot)
         {
-            if (snapshot.Maps.Count == 0) return null;
-            MapDebugEntry selected = snapshot.Maps.FirstOrDefault(
+            MapDebugEntry entry = snapshot.Maps.FirstOrDefault(
                 item => string.Equals(item.Key, selectedKey, StringComparison.Ordinal));
-            if (selected != null) return selected;
-            selected = snapshot.Maps.FirstOrDefault(item => item.IsCurrent) ?? snapshot.Maps[0];
-            selectedKey = selected.Key;
-            return selected;
+            if (entry != null) return entry;
+            entry = snapshot.Maps.FirstOrDefault(item => item.IsCurrent) ?? snapshot.Maps.FirstOrDefault();
+            selectedKey = entry?.Key;
+            return entry;
+        }
+
+        static string DefaultExportPath(string mapId)
+        {
+            string safe = string.IsNullOrWhiteSpace(mapId) ? "map" : mapId.Trim();
+            foreach (char invalid in Path.GetInvalidFileNameChars()) safe = safe.Replace(invalid, '_');
+            return Path.GetFullPath(Path.Combine(Application.dataPath, "..", "PolarisCaptures", safe + ".png"));
         }
 
         static void HoldInput(bool hold)
@@ -326,174 +278,198 @@ namespace Polaris.Map.Debugging
             else IN.FlgUiUse.Rem(InputFlag);
         }
 
+        static void ApplyCameraBorderShadowSwitch()
+        {
+            M2DBase world = M2DBase.Instance;
+            Map2d currentMap = world?.curMap;
+            if (!hideCameraBorderShadow || currentMap == null)
+            {
+                RestoreCameraComposite();
+                return;
+            }
+
+            if (cameraCompositeMap != null && !ReferenceEquals(cameraCompositeMap, currentMap))
+                RestoreCameraComposite();
+
+            M2Camera camera = world.Cam;
+            if (camera == null
+                || !ReferenceEquals(ActiveCameraMap.GetValue(camera), currentMap)
+                || !ReferenceEquals(camera.CurDgn, currentMap.Dgn))
+            {
+                RestoreCameraComposite();
+                return;
+            }
+            M2MeshContainer meshes = camera == null
+                ? null
+                : CameraMeshes.GetValue(camera) as M2MeshContainer;
+            int index = FindCameraMesh(meshes, "MpMMRD- main_rendered");
+            if (meshes == null || index < 0)
+            {
+                RestoreCameraComposite();
+                return;
+            }
+
+            GameObject compositeObject = meshes.GetGob(index);
+            if (cameraMeshes != meshes
+                || cameraCompositeIndex != index
+                || cameraCompositeObject != compositeObject
+                || (shadowFreeCameraCompositeMaterial != null
+                    && meshes.getMaterial(index) != shadowFreeCameraCompositeMaterial))
+            {
+                RestoreCameraComposite();
+
+                Material original = meshes.getMaterial(index);
+                if (original == null
+                    || original.shader == null
+                    || original.shader.name != "M2d/ImageWithLight")
+                    return;
+
+                Shader noFadeShader = CameraCompositeShaderLoader.GetNoCameraFadeShader();
+                if (noFadeShader == null)
+                {
+                    notice = "Camera shadow shader could not be loaded.";
+                    return;
+                }
+
+                cameraMeshes = meshes;
+                cameraCompositeObject = compositeObject;
+                cameraCompositeIndex = index;
+                cameraCompositeMaterial = original;
+                cameraCompositeMap = currentMap;
+                shadowFreeCameraCompositeMaterial = new Material(noFadeShader)
+                {
+                    name = "PolarisMap Shadow-Free Camera Composite",
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                shadowFreeCameraCompositeMaterial.CopyPropertiesFromMaterial(original);
+                meshes.setMaterial(index, shadowFreeCameraCompositeMaterial);
+            }
+
+            // DungeonBright keeps updating the original material as lighting/weather changes.
+            // Mirror those property values while retaining our replacement shader.
+            if (cameraCompositeMap == null
+                || !ReferenceEquals(cameraCompositeMap, currentMap)
+                || shadowFreeCameraCompositeMaterial == null
+                || cameraCompositeMaterial == null)
+            {
+                RestoreCameraComposite();
+                return;
+            }
+
+            shadowFreeCameraCompositeMaterial.CopyPropertiesFromMaterial(cameraCompositeMaterial);
+            if (meshes.getMaterial(index) != shadowFreeCameraCompositeMaterial)
+                meshes.setMaterial(index, shadowFreeCameraCompositeMaterial);
+        }
+
+        static int FindCameraMesh(M2MeshContainer meshes, string name)
+        {
+            if (meshes == null) return -1;
+            for (int i = 0; i < meshes.Length; i++)
+            {
+                GameObject target = meshes.GetGob(i);
+                if (target != null && target.name == name) return i;
+            }
+            return -1;
+        }
+
+        static void RestoreCameraComposite()
+        {
+            if (cameraMeshes != null
+                && cameraCompositeIndex >= 0
+                && cameraCompositeIndex < cameraMeshes.Length
+                && cameraCompositeObject != null
+                && cameraMeshes.GetGob(cameraCompositeIndex) == cameraCompositeObject
+                && cameraMeshes.getMaterial(cameraCompositeIndex) == shadowFreeCameraCompositeMaterial
+                && cameraCompositeMaterial != null)
+                cameraMeshes.setMaterial(cameraCompositeIndex, cameraCompositeMaterial);
+
+            if (shadowFreeCameraCompositeMaterial != null)
+                UnityEngine.Object.Destroy(shadowFreeCameraCompositeMaterial);
+
+            cameraMeshes = null;
+            cameraCompositeObject = null;
+            cameraCompositeIndex = -1;
+            cameraCompositeMaterial = null;
+            shadowFreeCameraCompositeMaterial = null;
+            cameraCompositeMap = null;
+        }
+
+        static void RefreshMapLayers()
+        {
+            Map2d current = M2DBase.Instance?.curMap;
+            M2MapLayer[] currentLayers = current?.getLayerArray() ?? Array.Empty<M2MapLayer>();
+            if (ReferenceEquals(analyzedLayerMap, current)
+                && analyzedLayers.Length == currentLayers.Length)
+            {
+                bool unchanged = true;
+                for (int i = 0; i < currentLayers.Length; i++)
+                    if (!ReferenceEquals(analyzedLayers[i], currentLayers[i]))
+                    {
+                        unchanged = false;
+                        break;
+                    }
+                if (unchanged) return;
+            }
+
+            analyzedLayerMap = current;
+            analyzedLayers = currentLayers;
+            exportLayerEnabled = new bool[analyzedLayers.Length];
+            for (int i = 0; i < analyzedLayers.Length; i++)
+                exportLayerEnabled[i] = analyzedLayers[i] != null && analyzedLayers[i].visible;
+            layerScroll = Vector2.zero;
+        }
+
+        static void DrawMapLayers()
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Map layers", GUILayout.Width(70f));
+            bool oldEnabled = GUI.enabled;
+            GUI.enabled = oldEnabled && analyzedLayers.Length != 0;
+            if (GUILayout.Button("All", GUILayout.Width(48f)))
+                for (int i = 0; i < exportLayerEnabled.Length; i++) exportLayerEnabled[i] = true;
+            if (GUILayout.Button("None", GUILayout.Width(48f)))
+                for (int i = 0; i < exportLayerEnabled.Length; i++) exportLayerEnabled[i] = false;
+            GUI.enabled = oldEnabled;
+            GUILayout.EndHorizontal();
+
+            layerScroll = GUILayout.BeginScrollView(layerScroll, GUILayout.Height(120f));
+            if (analyzedLayers.Length == 0)
+            {
+                GUILayout.Label("No active map layers.");
+            }
+            else
+            {
+                for (int i = 0; i < analyzedLayers.Length; i++)
+                {
+                    M2MapLayer layer = analyzedLayers[i];
+                    string name = layer == null || string.IsNullOrEmpty(layer.name)
+                        ? "(unnamed)"
+                        : layer.name;
+                    exportLayerEnabled[i] = GUILayout.Toggle(
+                        exportLayerEnabled[i], $"[{i}] {name}");
+                }
+            }
+            GUILayout.EndScrollView();
+        }
+
+        static int[] EnabledLayerIndices()
+        {
+            var enabled = new List<int>(exportLayerEnabled.Length);
+            for (int i = 0; i < exportLayerEnabled.Length; i++)
+                if (exportLayerEnabled[i]) enabled.Add(i);
+            return enabled.ToArray();
+        }
+
         static void ClampWindow()
         {
-            float width = Mathf.Min(window.width, Screen.width - 20f);
-            float height = Mathf.Min(window.height, Screen.height - 20f);
+            float width = Mathf.Min(window.width, Mathf.Max(260f, Screen.width - 20f));
+            float height = Mathf.Min(window.height, Mathf.Max(220f, Screen.height - 20f));
             window = new Rect(
-                Mathf.Clamp(window.x, 0, Math.Max(0, Screen.width - width)),
-                Mathf.Clamp(window.y, 0, Math.Max(0, Screen.height - height)),
-                width, height);
+                Mathf.Clamp(window.x, 0f, Math.Max(0f, Screen.width - width)),
+                Mathf.Clamp(window.y, 0f, Math.Max(0f, Screen.height - height)),
+                width,
+                height);
         }
 
-        static void EnsureStyles()
-        {
-            if (stylesReady) return;
-            stylesReady = true;
-            Font body = CreateFont(new[] { "Microsoft YaHei UI", "Microsoft YaHei", "Meiryo", "Segoe UI" }, 13);
-            Font mono = CreateFont(new[] { "Cascadia Mono", "Consolas", "Courier New" }, 12);
-
-            Texture2D graphite = SolidTexture(new Color(.105f, .125f, .15f));
-            Texture2D slate = SolidTexture(new Color(.145f, .17f, .20f));
-            Texture2D raised = SolidTexture(new Color(.205f, .235f, .27f));
-            Texture2D cyan = SolidTexture(new Color(.50f, .72f, .79f));
-            Texture2D amber = SolidTexture(new Color(.89f, .66f, .28f));
-            Texture2D metric = SolidTexture(new Color(.12f, .145f, .17f));
-
-            Styles.Window = Style(GUI.skin.window, body, Color.white, graphite);
-            Styles.Window.padding = new RectOffset(10, 10, 25, 9);
-            Styles.Panel = Style(GUI.skin.box, body, Color.white, slate);
-            Styles.Panel.padding = new RectOffset(9, 9, 9, 9);
-            Styles.Button = Style(GUI.skin.button, body, new Color(.89f, .92f, .94f), raised);
-            Styles.SelectedButton = Style(GUI.skin.button, body, new Color(.08f, .12f, .15f), cyan);
-            Styles.ReloadButton = Style(GUI.skin.button, body, new Color(.11f, .09f, .05f), amber);
-            Styles.Header = Label(body, new Color(.78f, .88f, .93f), 18, FontStyle.Bold);
-            Styles.Eyebrow = Label(mono, new Color(.50f, .72f, .79f), 10, FontStyle.Bold);
-            Styles.Dim = Label(body, new Color(.60f, .65f, .69f), 12);
-            Styles.MonoDim = Label(mono, new Color(.57f, .64f, .68f), 11);
-            Styles.MonoValue = Label(mono, new Color(.94f, .96f, .97f), 16, FontStyle.Bold);
-            Styles.Current = Label(mono, new Color(.58f, .85f, .70f), 12, FontStyle.Bold);
-            Styles.Marker = Label(mono, new Color(.89f, .66f, .28f), 11, FontStyle.Bold);
-            Styles.Small = Label(body, new Color(.61f, .66f, .70f), 10);
-            Styles.Small.wordWrap = true;
-            Styles.Empty = Label(body, new Color(.67f, .73f, .77f), 14);
-            Styles.Empty.wordWrap = true;
-            Styles.Error = Label(body, new Color(1f, .47f, .39f), 12);
-            Styles.Error.wordWrap = true;
-            Styles.Status = Label(body, new Color(.78f, .83f, .86f), 11);
-            Styles.Status.wordWrap = true;
-            Styles.Metric = Style(GUI.skin.box, body, Color.white, metric);
-            Styles.Metric.padding = new RectOffset(7, 7, 5, 5);
-            Styles.SourceFrame = Style(GUI.skin.box, mono, Color.white, metric);
-            Styles.SourceFrame.padding = new RectOffset(3, 3, 3, 3);
-            Styles.Source = Style(GUI.skin.textArea, mono, new Color(.82f, .88f, .91f), graphite);
-            Styles.Source.wordWrap = false;
-            Styles.BlockLight = Label(mono, Color.white, 10, FontStyle.Bold);
-            Styles.BlockLight.alignment = TextAnchor.MiddleCenter;
-            Styles.BlockLight.clipping = TextClipping.Clip;
-            Styles.BlockDark = Label(mono, new Color(.08f, .10f, .12f), 10, FontStyle.Bold);
-            Styles.BlockDark.alignment = TextAnchor.MiddleCenter;
-            Styles.BlockDark.clipping = TextClipping.Clip;
-        }
-
-        static GUIStyle Style(GUIStyle basis, Font font, Color text, Texture2D background)
-        {
-            var style = new GUIStyle(basis) { font = font };
-            style.normal.textColor = text;
-            style.normal.background = background;
-            style.hover.textColor = text;
-            style.hover.background = background;
-            style.active.textColor = text;
-            style.active.background = background;
-            style.focused.textColor = text;
-            style.focused.background = background;
-            return style;
-        }
-
-        static GUIStyle Label(Font font, Color color, int size, FontStyle fontStyle = FontStyle.Normal)
-        {
-            var style = new GUIStyle(GUI.skin.label)
-            {
-                font = font,
-                fontSize = size,
-                fontStyle = fontStyle,
-            };
-            style.normal.textColor = color;
-            return style;
-        }
-
-        static Font CreateFont(string[] names, int size)
-        {
-            try
-            {
-                Font font = Font.CreateDynamicFontFromOSFont(names, size);
-                if (font != null) font.hideFlags = HideFlags.DontUnloadUnusedAsset;
-                return font;
-            }
-            catch { return null; }
-        }
-
-        static Texture2D SolidTexture(Color color)
-        {
-            var texture = new Texture2D(1, 1, TextureFormat.RGBA32, false)
-            {
-                hideFlags = HideFlags.DontUnloadUnusedAsset,
-            };
-            texture.SetPixel(0, 0, color);
-            texture.Apply(false, true);
-            StyleTextures.Add(texture);
-            return texture;
-        }
-
-        static void DrawSolid(Rect rect, Color color)
-        {
-            Color previous = GUI.color;
-            GUI.color = color;
-            GUI.DrawTexture(rect, Texture2D.whiteTexture);
-            GUI.color = previous;
-        }
-
-        static Color ParseColor(string value, Color fallback)
-        {
-            try
-            {
-                string text = PmapDocument.NormalizeColor(value).Substring(1);
-                byte r = byte.Parse(text.Substring(0, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
-                byte g = byte.Parse(text.Substring(2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
-                byte b = byte.Parse(text.Substring(4, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
-                byte a = text.Length == 8
-                    ? byte.Parse(text.Substring(6, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture)
-                    : byte.MaxValue;
-                return new Color32(r, g, b, a);
-            }
-            catch { return fallback; }
-        }
-
-        static bool IsDark(Color color)
-            => .2126f * color.r + .7152f * color.g + .0722f * color.b < .55f;
-
-        static Rect Intersect(Rect a, Rect b)
-        {
-            float left = Mathf.Max(a.xMin, b.xMin);
-            float top = Mathf.Max(a.yMin, b.yMin);
-            float right = Mathf.Min(a.xMax, b.xMax);
-            float bottom = Mathf.Min(a.yMax, b.yMax);
-            return Rect.MinMaxRect(left, top, Mathf.Max(left, right), Mathf.Max(top, bottom));
-        }
-
-        static class Styles
-        {
-            internal static GUIStyle Window;
-            internal static GUIStyle Panel;
-            internal static GUIStyle Button;
-            internal static GUIStyle SelectedButton;
-            internal static GUIStyle ReloadButton;
-            internal static GUIStyle Header;
-            internal static GUIStyle Eyebrow;
-            internal static GUIStyle Dim;
-            internal static GUIStyle MonoDim;
-            internal static GUIStyle MonoValue;
-            internal static GUIStyle Current;
-            internal static GUIStyle Marker;
-            internal static GUIStyle Small;
-            internal static GUIStyle Empty;
-            internal static GUIStyle Error;
-            internal static GUIStyle Status;
-            internal static GUIStyle Metric;
-            internal static GUIStyle SourceFrame;
-            internal static GUIStyle Source;
-            internal static GUIStyle BlockLight;
-            internal static GUIStyle BlockDark;
-        }
     }
 }

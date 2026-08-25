@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using m2d;
 
 namespace Polaris.Map.Internal
@@ -31,7 +32,27 @@ namespace Polaris.Map.Internal
                 throw new ArgumentException("Image source cannot be empty.", parameterName);
             }
 
-            M2ChipImage image = images?.Get(source);
+            string path = source;
+            M2ChipImage image = null;
+            int hash = source.LastIndexOf('#');
+            string pathForDirectory = hash > 0 ? source.Substring(0, hash) : source;
+            int directorySlash = pathForDirectory.LastIndexOf('/');
+            string declaredDirectory = directorySlash < 0 ? null : pathForDirectory.Substring(0, directorySlash + 1);
+            if (images != null && declaredDirectory != null)
+            {
+                // Get/GetById 只查已经展开的目录；转换来的 PMAP 可能是本局尚未用过的图集。
+                images.initializeChipsDirectory(declaredDirectory, -1, no_make_dir: true);
+            }
+            if (hash > 0 && uint.TryParse(source.Substring(hash + 1), NumberStyles.None,
+                CultureInfo.InvariantCulture, out uint explicitId))
+            {
+                path = source.Substring(0, hash);
+                image = images?.GetById(explicitId) as M2ChipImage;
+            }
+            else
+            {
+                image = images?.Get(source);
+            }
             if (image == null)
             {
                 throw new ArgumentException(
@@ -45,8 +66,8 @@ namespace Polaris.Map.Internal
                     $"The map image has no stable TMAP image id: {source}.", parameterName);
             }
 
-            int slash = source.LastIndexOf('/');
-            string directory = slash < 0 ? null : source.Substring(0, slash + 1);
+            int slash = path.LastIndexOf('/');
+            string directory = slash < 0 ? null : path.Substring(0, slash + 1);
             return new ResolvedImage(image, id, directory);
         }
     }

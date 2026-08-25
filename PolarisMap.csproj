@@ -6,5 +6,10 @@
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="..\PolarisCore\PolarisCore.csproj" /></ItemGroup>
+  <ItemGroup><Compile Remove="tools\**\*.cs" /></ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\polarismap_shaders.bundle"
+                      LogicalName="Polaris.Map.Resources.polarismap_shaders.bundle" />
+  </ItemGroup>
   <Import Project="..\PolarisCore\build\Polaris.Runtime.props" />
 </Project>

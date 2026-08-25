@@ -1,0 +1,12 @@
+/AssetBundles/
+/Library/
+/Logs/
+/Packages/
+/Temp/
+/UserSettings/
+/build.log
+/Assets/PolarisMapNoCameraFade.shader
+/Assets/*.meta
+/Assets/Editor/*.meta
+/ProjectSettings/*
+!/ProjectSettings/ProjectVersion.txt

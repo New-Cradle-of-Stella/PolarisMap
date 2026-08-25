@@ -19,12 +19,16 @@ namespace Polaris.Map
         public override void Update()
         {
             MapRuntime.Update();
+            MapPngExportRuntime.Update();
             MapDebugRuntime.Update();
         }
+
+        public override void LateUpdate() => MapPngExportRuntime.LateUpdate();
 
         public override void Shutdown()
         {
             MapDebugRuntime.Shutdown();
+            MapPngExportRuntime.Shutdown();
             MapRuntime.Shutdown();
         }
     }

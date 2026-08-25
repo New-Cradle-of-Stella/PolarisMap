@@ -28,5 +28,15 @@ namespace Polaris.Map
             PmapDocument document = PmapDocument.Parse(xml, sourceName);
             return MapRuntime.LoadAndEnterPmap(document, ownerType, xml);
         }
+
+        /// <summary>
+        /// 按游戏地图 ID 导出一张完整场景 PNG。若目标不是当前地图，默认先走游戏原生异步转场；
+        /// 操作返回后通过 <see cref="MapPngExport.Status"/> 或 <see cref="MapPngExport.Finished"/> 观察结果。
+        /// </summary>
+        public static MapPngExport ExportMapPng(
+            string mapId,
+            string outputPath,
+            MapPngExportOptions options = null)
+            => MapPngExportRuntime.Start(mapId, outputPath, options);
     }
 }
